@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import unittest
 
-from models import GuildConfig, format_duration, parse_duration, plural
+from models import (
+    GuildConfig,
+    format_duration,
+    parse_ban_duration,
+    parse_duration,
+    plural,
+)
 
 
 class DurationTests(unittest.TestCase):
@@ -28,6 +34,14 @@ class DurationTests(unittest.TestCase):
         self.assertEqual(format_duration(5400), "1 ч 30 мин")
         self.assertEqual(format_duration(90000), "1 д 1 ч")
 
+    def test_ban_duration(self) -> None:
+        self.assertEqual(parse_ban_duration("7d"), 604800)
+        self.assertEqual(parse_ban_duration("12h"), 43200)
+        self.assertEqual(parse_ban_duration("0"), 0)
+        self.assertEqual(parse_ban_duration("навсегда"), 0)
+        with self.assertRaises(ValueError):
+            parse_ban_duration("abc")
+
     def test_plural(self) -> None:
         self.assertEqual(plural(1, "сообщение", "сообщения", "сообщений"), "сообщение")
         self.assertEqual(plural(3, "сообщение", "сообщения", "сообщений"), "сообщения")
@@ -44,6 +58,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.phash_distance, 8)
         self.assertFalse(config.cross_channel_only)
         self.assertFalse(config.multi_user)
+        self.assertEqual(config.ban_duration_seconds, 0)
 
 
 if __name__ == "__main__":

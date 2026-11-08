@@ -33,6 +33,7 @@ from models import (
     MIN_THRESHOLD,
     STATUS_ACTIONED,
     STATUS_BANNED,
+    STATUS_CANCELLED,
     STATUS_DELETED,
     STATUS_FAILED,
     STATUS_OPEN,
@@ -40,6 +41,7 @@ from models import (
     GuildConfig,
     Incident,
     format_duration,
+    parse_ban_duration,
     parse_duration,
 )
 from reporting import (
@@ -47,6 +49,7 @@ from reporting import (
     COLOR_DELETE,
     COLOR_NOTIFY,
     build_alert_embed,
+    build_bans_embed,
     build_report_embed,
     build_settings_embed,
 )
@@ -130,6 +133,30 @@ class AlertBanButton(
         )
 
 
+class ReportCancelButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"dup:(?P<id>\d+):cancel",
+):
+    def __init__(self, incident_id: int) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="Прекратить удаление",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"dup:{incident_id}:cancel",
+            )
+        )
+        self.incident_id = incident_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):  # noqa: ANN001
+        return cls(int(match.group("id")))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.client.handle_cancel_delete(  # type: ignore[attr-defined]
+            interaction, self.incident_id
+        )
+
+
 class DuplicateGuardBot(discord.Client):
     def __init__(
         self,
@@ -155,7 +182,9 @@ class DuplicateGuardBot(discord.Client):
         self._warned_at: dict[tuple[int, str], float] = {}
         self._excluded_roles: dict[int, set[int]] = {}
 
-        self.add_dynamic_items(AlertDeleteButton, AlertBanButton)
+        self.add_dynamic_items(
+            AlertDeleteButton, AlertBanButton, ReportCancelButton
+        )
         register_commands(self)
 
     # --- жизненный цикл -------------------------------------------------
@@ -186,6 +215,10 @@ class DuplicateGuardBot(discord.Client):
             self._expiry_loop.start()
         if self.hash_retention_seconds > 0 and not self._cleanup_loop.is_running():
             self._cleanup_loop.start()
+
+        await self._process_due_bans()
+        if not self._unban_loop.is_running():
+            self._unban_loop.start()
 
     # --- события --------------------------------------------------------
     async def on_message(self, message: discord.Message) -> None:
@@ -404,6 +437,7 @@ class DuplicateGuardBot(discord.Client):
                 title="Удаление сообщений",
                 result_text=result,
                 color=COLOR_DELETE,
+                allow_cancel=True,
             )
         else:
             await self._publish_alert(guild, config, incident)
@@ -451,6 +485,7 @@ class DuplicateGuardBot(discord.Client):
                 title="Удаление сообщений",
                 result_text=result,
                 color=COLOR_DELETE,
+                allow_cancel=True,
             )
 
         else:
@@ -485,6 +520,12 @@ class DuplicateGuardBot(discord.Client):
         )
         banned: list[int] = []
         failed: list[int] = []
+        now = int(time.time())
+        unban_at = (
+            now + config.ban_duration_seconds
+            if config.ban_duration_seconds > 0
+            else 0
+        )
 
         for user_id in incident.user_ids:
             target = (
@@ -499,6 +540,21 @@ class DuplicateGuardBot(discord.Client):
                     delete_message_seconds=min(config.window_seconds, 604800),
                 )
                 banned.append(user_id)
+                try:
+                    if unban_at:
+                        await self.storage.upsert_ban(
+                            guild_id=guild.id,
+                            user_id=user_id,
+                            incident_id=incident.id,
+                            banned_at=now,
+                            unban_at=unban_at,
+                        )
+                    else:
+                        await self.storage.clear_ban(guild.id, user_id)
+                except Exception:
+                    log.exception(
+                        "Не удалось сохранить временный бан %s", user_id
+                    )
             except discord.HTTPException as exc:
                 failed.append(user_id)
                 self._warn(
@@ -517,6 +573,11 @@ class DuplicateGuardBot(discord.Client):
             parts.append(
                 "Не удалось забанить: "
                 + ", ".join(f"<@{user_id}>" for user_id in failed)
+            )
+        if unban_at and banned:
+            parts.append(
+                f"Временный бан до <t:{unban_at}:R> "
+                f"(<t:{unban_at}:f>)."
             )
         parts.append(
             f"Сообщения: удалено {deleted}, уже отсутствовали {gone}, "
@@ -612,10 +673,24 @@ class DuplicateGuardBot(discord.Client):
         title: str,
         result_text: str,
         color: int,
+        allow_cancel: bool = False,
+        remove_view: bool = False,
     ) -> None:
         embed = build_report_embed(
             incident, title=title, result_text=result_text, color=color
         )
+
+        cancel_view = None
+        if allow_cancel:
+            cancel_view = discord.ui.View(timeout=None)
+            cancel_view.add_item(ReportCancelButton(incident.id))
+
+        if remove_view:
+            view_arg = None
+        elif allow_cancel:
+            view_arg = cancel_view
+        else:
+            view_arg = _UNSET
 
         if incident.report_channel_id and incident.report_message_id:
             if await self._edit_message(
@@ -623,6 +698,7 @@ class DuplicateGuardBot(discord.Client):
                 incident.report_channel_id,
                 incident.report_message_id,
                 embed=embed,
+                view=view_arg,
             ):
                 return
 
@@ -634,6 +710,7 @@ class DuplicateGuardBot(discord.Client):
         try:
             message = await channel.send(
                 embed=embed,
+                view=cancel_view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException as exc:
@@ -733,6 +810,7 @@ class DuplicateGuardBot(discord.Client):
             title="Удаление завершено",
             result_text=result,
             color=COLOR_DELETE,
+            remove_view=True,
         )
 
     async def _purge_old_hashes(self) -> None:
@@ -742,20 +820,64 @@ class DuplicateGuardBot(discord.Client):
         try:
             removed_images = await self.storage.purge_images_before(cutoff)
             removed_incidents = await self.storage.purge_incidents_before(cutoff)
+            removed_bans = await self.storage.purge_bans_before(cutoff)
         except Exception:
             log.exception("Не удалось очистить старые хеши")
             return
-        if removed_images or removed_incidents:
+        if removed_images or removed_incidents or removed_bans:
             log.info(
-                "Очистка хранения (%s): изображений %d, закрытых инцидентов %d",
+                "Очистка хранения (%s): изображений %d, "
+                "закрытых инцидентов %d, старых банов %d",
                 format_duration(self.hash_retention_seconds),
                 removed_images,
                 removed_incidents,
+                removed_bans,
             )
 
     @tasks.loop(hours=1)
     async def _cleanup_loop(self) -> None:
         await self._purge_old_hashes()
+
+    async def _process_due_bans(self) -> None:
+        now = int(time.time())
+        try:
+            due = await self.storage.due_bans(now)
+        except Exception:
+            log.exception("Не удалось получить баны для разбана")
+            return
+
+        for ban in due:
+            guild = self.get_guild(ban.guild_id)
+            if guild is None:
+                continue
+            try:
+                await guild.unban(
+                    discord.Object(id=ban.user_id),
+                    reason="Временный бан истёк",
+                )
+            except discord.NotFound:
+                await self.storage.mark_unbanned(ban.guild_id, ban.user_id)
+            except discord.HTTPException as exc:
+                await self.storage.mark_ban_attempt(
+                    ban.guild_id, ban.user_id, now
+                )
+                log.warning(
+                    "Не удалось разбанить %s на сервере %s: %s",
+                    ban.user_id,
+                    ban.guild_id,
+                    exc,
+                )
+            else:
+                await self.storage.mark_unbanned(ban.guild_id, ban.user_id)
+                log.info(
+                    "Временный бан истёк: %s на сервере %s",
+                    ban.user_id,
+                    ban.guild_id,
+                )
+
+    @tasks.loop(seconds=60)
+    async def _unban_loop(self) -> None:
+        await self._process_due_bans()
 
     @tasks.loop(seconds=30)
     async def _expiry_loop(self) -> None:
@@ -779,6 +901,72 @@ class DuplicateGuardBot(discord.Client):
                 log.exception("Не удалось завершить инцидент #%s", incident.id)
 
     # --- кнопки ---------------------------------------------------------
+    async def handle_cancel_delete(
+        self, interaction: discord.Interaction, incident_id: int
+    ) -> None:
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "Действие доступно только на сервере.", ephemeral=True
+            )
+            return
+
+        member = interaction.user
+        guild = interaction.guild
+        if not await self._is_allowed(member):
+            await interaction.response.send_message(
+                "У вас нет доступа к этому действию.", ephemeral=True
+            )
+            return
+        permissions = member.guild_permissions
+        if not (permissions.administrator or permissions.manage_messages):
+            await interaction.response.send_message(
+                "Нужно право «Управлять сообщениями».", ephemeral=True
+            )
+            return
+
+        incident = await self.storage.get_incident(incident_id)
+        if incident is None or incident.guild_id != guild.id:
+            await interaction.response.send_message(
+                "Инцидент не найден.", ephemeral=True
+            )
+            return
+        if incident.status != STATUS_WATCHING:
+            await interaction.response.send_message(
+                "Удаление уже завершено.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        now = int(time.time())
+        result = f"Удаление остановлено: <@{member.id}>."
+        if not await self.storage.cancel_delete(
+            incident.id, result=result, resolved_at=now
+        ):
+            await interaction.followup.send(
+                "Удаление уже завершено.", ephemeral=True
+            )
+            return
+
+        incident.status = STATUS_CANCELLED
+        incident.result = result
+        incident.resolved_at = now
+        incident.window_closed = True
+        config = await self.storage.get_config(guild.id)
+        await self._publish_report(
+            guild,
+            config,
+            incident,
+            title="Удаление остановлено",
+            result_text=result,
+            color=COLOR_DELETE,
+            remove_view=True,
+        )
+        await interaction.followup.send(
+            "Мониторинг удаления остановлен.", ephemeral=True
+        )
+
     async def handle_alert_action(
         self, interaction: discord.Interaction, incident_id: int, action: str
     ) -> None:
@@ -1012,7 +1200,10 @@ class DuplicateGuardBot(discord.Client):
         return problems
 
     async def cmd_behavior(
-        self, interaction: discord.Interaction, action: str
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        duration: Optional[str] = None,
     ) -> None:
         config = await self._require_allowed(interaction)
         if config is None:
@@ -1023,12 +1214,50 @@ class DuplicateGuardBot(discord.Client):
             )
             return
 
+        ignored_duration = False
+        if action == "ban" and duration is not None:
+            try:
+                config.ban_duration_seconds = parse_ban_duration(duration)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        elif action != "ban" and duration is not None:
+            ignored_duration = True
+
         config.action = action
         await self.storage.save_config(config)
+
+        parts = [f"Новое действие при срабатывании: {ACTION_LABELS[action]}."]
+        if action == "ban":
+            parts.append(
+                "Время бана: "
+                + (
+                    format_duration(config.ban_duration_seconds)
+                    if config.ban_duration_seconds > 0
+                    else "бессрочно"
+                )
+                + "."
+            )
+        if ignored_duration:
+            parts.append(
+                "Параметр duration применяется только к действию «Бан» "
+                "и был проигнорирован."
+            )
+        parts.append("Изменение применяется к новым инцидентам.")
+
         await interaction.response.send_message(
-            f"Новое действие при срабатывании: {ACTION_LABELS[action]}. "
-            "Изменение применяется к новым инцидентам.",
-            ephemeral=True,
+            " ".join(parts), ephemeral=True
+        )
+
+    async def cmd_bans(self, interaction: discord.Interaction) -> None:
+        config = await self._require_allowed(interaction)
+        if config is None:
+            return
+        guild = interaction.guild
+        assert guild is not None
+        records = await self.storage.get_active_bans(guild.id)
+        await interaction.response.send_message(
+            embed=build_bans_embed(records), ephemeral=True
         )
 
     async def cmd_detection(
@@ -1113,6 +1342,7 @@ class DuplicateGuardBot(discord.Client):
             notify_channel=notify_channel,
             excluded_role_ids=excluded,
             hash_retention_seconds=self.hash_retention_seconds,
+            ban_duration_seconds=config.ban_duration_seconds,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1267,11 +1497,20 @@ def register_commands(bot: DuplicateGuardBot) -> None:
             app_commands.Choice(name="Уведомление", value="notify"),
         ]
     )
+    @app_commands.describe(
+        action="Действие при срабатывании",
+        duration=(
+            "Только для действия «Бан»: 7d, 12h или 0/навсегда; "
+            "пусто — не менять текущее значение"
+        ),
+    )
     @app_commands.guild_only()
     async def behavior(
-        interaction: discord.Interaction, action: app_commands.Choice[str]
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        duration: Optional[str] = None,
     ) -> None:
-        await bot.cmd_behavior(interaction, action.value)
+        await bot.cmd_behavior(interaction, action.value, duration)
 
     @tree.command(
         name="detection",
@@ -1306,6 +1545,13 @@ def register_commands(bot: DuplicateGuardBot) -> None:
     @app_commands.guild_only()
     async def settings(interaction: discord.Interaction) -> None:
         await bot.cmd_settings(interaction)
+
+    @tree.command(
+        name="bans", description="Показать активные временные баны"
+    )
+    @app_commands.guild_only()
+    async def bans(interaction: discord.Interaction) -> None:
+        await bot.cmd_bans(interaction)
 
     roles_group = app_commands.Group(
         name="roles",

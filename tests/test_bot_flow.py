@@ -97,7 +97,8 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_tree(self) -> None:
         commands = {command.name: command for command in self.bot.tree.get_commands()}
         self.assertEqual(
-            set(commands), {"channels", "behavior", "detection", "settings", "roles"}
+            set(commands),
+            {"channels", "behavior", "detection", "settings", "bans", "roles"},
         )
         self.assertEqual(
             {command.name for command in commands["roles"].commands},
@@ -234,7 +235,7 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
             return 1, 0, 0
 
         async def publish_report(
-            guild, config, current, *, title, result_text, color
+            guild, config, current, *, title, result_text, color, **kwargs
         ):  # noqa: ANN001
             reports.append((current, title, result_text))
 
@@ -283,7 +284,9 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
             return 2, 0, 0
 
         self.bot._delete_refs = delete_refs  # type: ignore[method-assign]
-        config = GuildConfig(guild_id=100, window_seconds=3600)
+        config = GuildConfig(
+            guild_id=100, window_seconds=3600, ban_duration_seconds=3600
+        )
 
         result, success = await self.bot._ban_and_delete(
             FakeGuild(), config, incident
@@ -293,6 +296,32 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(banned, [1, 2])
         self.assertIn("<@1>", result)
         self.assertIn("<@2>", result)
+        self.assertIn("Временный бан", result)
+
+        records = await self.storage.get_active_bans(100)
+        self.assertEqual({record.user_id for record in records}, {1, 2})
+        for record in records:
+            self.assertGreater(record.unban_at, record.banned_at)
+
+    async def test_process_due_bans_unbans(self) -> None:
+        await self.storage.upsert_ban(
+            guild_id=100,
+            user_id=42,
+            incident_id=None,
+            banned_at=0,
+            unban_at=0,
+        )
+        calls: list[int] = []
+
+        class FakeGuild:
+            async def unban(self, user, **kwargs):  # noqa: ANN001
+                calls.append(user.id)
+
+        self.bot.get_guild = lambda guild_id: FakeGuild()  # type: ignore[method-assign]
+        await self.bot._process_due_bans()
+
+        self.assertEqual(calls, [42])
+        self.assertEqual(await self.storage.get_active_bans(100), [])
 
     async def test_role_access(self) -> None:
         await self.storage.add_role(100, 50)

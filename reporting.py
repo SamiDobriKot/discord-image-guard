@@ -9,6 +9,7 @@ import discord
 
 from models import (
     ACTION_LABELS,
+    BanRecord,
     GuildConfig,
     Incident,
     format_duration,
@@ -156,6 +157,7 @@ def build_settings_embed(
     notify_channel: Optional[discord.abc.GuildChannel] = None,
     excluded_role_ids: Iterable[int] = (),
     hash_retention_seconds: int = 0,
+    ban_duration_seconds: int = 0,
 ) -> discord.Embed:
     embed = discord.Embed(
         title="Настройки защиты от дубликатов",
@@ -220,6 +222,15 @@ def build_settings_embed(
         ),
         inline=True,
     )
+    embed.add_field(
+        name="Время бана",
+        value=(
+            format_duration(ban_duration_seconds)
+            if ban_duration_seconds > 0
+            else "бессрочно"
+        ),
+        inline=True,
+    )
 
     roles = list(dict.fromkeys(role_ids))
     if roles:
@@ -250,4 +261,23 @@ def build_settings_embed(
         inline=False,
     )
     embed.set_footer(text="Хеши хранятся только в локальной базе и не публикуются")
+    return embed
+
+
+def build_bans_embed(records: Iterable[BanRecord]) -> discord.Embed:
+    bans = list(records)
+    embed = discord.Embed(title="Временные баны", colour=COLOR_BAN)
+    if not bans:
+        embed.description = "Активных временных банов нет."
+        return embed
+
+    lines = [
+        f"<@{ban.user_id}> — до <t:{ban.unban_at}:R> "
+        f"(<t:{ban.unban_at}:f>)"
+        for ban in bans[:20]
+    ]
+    if len(bans) > 20:
+        lines.append(f"и ещё {len(bans) - 20}")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=f"Всего активных: {len(bans)}")
     return embed

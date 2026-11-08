@@ -75,10 +75,41 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         config.cross_channel_only = True
         config.phash_distance = 6
         config.multi_user = True
+        config.ban_duration_seconds = 604800
         await self.storage.save_config(config)
 
         loaded = await self.storage.get_config(1)
         self.assertEqual(loaded, config)
+
+    async def test_config_migration_adds_ban_duration(self) -> None:
+        path = self._case_dir / "legacy.sqlite3"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE guild_config (
+                    guild_id INTEGER PRIMARY KEY,
+                    report_channel_id INTEGER,
+                    notify_channel_id INTEGER,
+                    action TEXT NOT NULL DEFAULT 'notify',
+                    threshold_count INTEGER NOT NULL DEFAULT 3,
+                    window_seconds INTEGER NOT NULL DEFAULT 3600,
+                    cross_channel_only INTEGER NOT NULL DEFAULT 0,
+                    phash_distance INTEGER NOT NULL DEFAULT 8,
+                    multi_user INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        legacy = Storage(path)
+        await legacy.init()
+        config = GuildConfig(guild_id=1, ban_duration_seconds=3600)
+        await legacy.save_config(config)
+        self.assertEqual((await legacy.get_config(1)).ban_duration_seconds, 3600)
 
     async def test_roles(self) -> None:
         await self.storage.add_role(1, 50)
@@ -177,6 +208,63 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             incident.id, STATUS_WATCHING, window_closed=True
         )
         self.assertEqual(await self.storage.expired_incidents(2000), [])
+
+    async def test_cancel_delete_is_atomic(self) -> None:
+        incident = await self._create_incident(status=STATUS_WATCHING)
+
+        self.assertTrue(
+            await self.storage.cancel_delete(
+                incident.id, result="остановлено", resolved_at=2000
+            )
+        )
+        self.assertFalse(
+            await self.storage.cancel_delete(
+                incident.id, result="ещё раз", resolved_at=2001
+            )
+        )
+
+        stored = await self.storage.get_incident(incident.id)
+        assert stored is not None
+        self.assertEqual(stored.status, "cancelled")
+        self.assertEqual(stored.result, "остановлено")
+        self.assertEqual(stored.resolved_at, 2000)
+
+    async def test_temp_ban_lifecycle_and_persistence(self) -> None:
+        await self.storage.upsert_ban(
+            guild_id=1,
+            user_id=10,
+            incident_id=5,
+            banned_at=1000,
+            unban_at=2000,
+        )
+        await self.storage.upsert_ban(
+            guild_id=1,
+            user_id=10,
+            incident_id=6,
+            banned_at=1100,
+            unban_at=2100,
+        )
+
+        active = await self.storage.get_active_bans(1)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].unban_at, 2100)
+        self.assertEqual(active[0].incident_id, 6)
+
+        reopened = Storage(self.storage.path)
+        await reopened.init()
+        self.assertEqual(len(await reopened.get_active_bans(1)), 1)
+
+        self.assertEqual(await self.storage.due_bans(2000), [])
+        due = await self.storage.due_bans(2100)
+        self.assertEqual([ban.user_id for ban in due], [10])
+
+        await self.storage.mark_ban_attempt(1, 10, 2100)
+        self.assertEqual(await self.storage.due_bans(2200), [])
+        self.assertEqual(len(await self.storage.due_bans(2100 + 3601)), 1)
+
+        await self.storage.mark_unbanned(1, 10)
+        self.assertEqual(await self.storage.get_active_bans(1), [])
+        self.assertEqual(await self.storage.due_bans(3000), [])
 
     async def test_stats(self) -> None:
         await self._insert_image(100)

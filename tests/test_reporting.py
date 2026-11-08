@@ -5,9 +5,10 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from models import GuildConfig, Incident
+from models import BanRecord, GuildConfig, Incident
 from reporting import (
     build_alert_embed,
+    build_bans_embed,
     build_report_embed,
     build_settings_embed,
     format_links,
@@ -106,6 +107,7 @@ class ReportingTests(unittest.TestCase):
             notify_channel=SimpleNamespace(mention="#alerts"),
             excluded_role_ids=[60],
             hash_retention_seconds=86400,
+            ban_duration_seconds=604800,
         )
         values = "\n".join(field.value for field in embed.fields)
         field_names = "\n".join(field.name for field in embed.fields)
@@ -115,10 +117,29 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("4 сообщения", values)
         self.assertIn("2 ч", values)
         self.assertIn("1 д", values)
+        self.assertIn("7 д", values)
         self.assertIn("<@&50>", values)
         self.assertIn("<@&60>", values)
         self.assertIn("Роли-исключения", field_names)
         self.assertIn("12", values)
+
+    def test_bans_embed(self) -> None:
+        embed = build_bans_embed(
+            [
+                BanRecord(
+                    guild_id=100,
+                    user_id=42,
+                    unban_at=2000,
+                    banned_at=1000,
+                )
+            ]
+        )
+        self.assertIn("<@42>", embed.description)
+        self.assertIn("<t:2000:R>", embed.description)
+        self.assertIn("Всего активных: 1", embed.footer.text)
+
+        empty = build_bans_embed([])
+        self.assertIn("нет", empty.description)
 
     def test_format_helpers(self) -> None:
         self.assertEqual(format_users([1, 2]), "<@1>\n<@2>")

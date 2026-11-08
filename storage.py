@@ -15,10 +15,12 @@ from models import (
     STATUS_ACTIONED,
     STATUS_ACTIONING,
     STATUS_BANNED,
+    STATUS_CANCELLED,
     STATUS_DELETED,
     STATUS_FAILED,
     STATUS_OPEN,
     STATUS_WATCHING,
+    BanRecord,
     GuildConfig,
     ImageRecord,
     Incident,
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS guild_config (
     cross_channel_only  INTEGER NOT NULL DEFAULT 0,
     phash_distance      INTEGER NOT NULL DEFAULT 8,
     multi_user          INTEGER NOT NULL DEFAULT 0,
+    ban_duration_seconds INTEGER NOT NULL DEFAULT 0,
     updated_at          INTEGER NOT NULL
 );
 
@@ -103,6 +106,21 @@ CREATE INDEX IF NOT EXISTS idx_incidents_guild_status
     ON incidents (guild_id, status);
 CREATE INDEX IF NOT EXISTS idx_incidents_expiry
     ON incidents (window_closed, expires_at);
+
+CREATE TABLE IF NOT EXISTS bans (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id        INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    incident_id     INTEGER,
+    banned_at       INTEGER NOT NULL,
+    unban_at        INTEGER NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 1,
+    last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (guild_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bans_due
+    ON bans (active, unban_at);
 """
 
 
@@ -129,6 +147,15 @@ class Storage:
         def _create() -> None:
             with closing(self._connect()) as connection, connection:
                 connection.executescript(_SCHEMA)
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(guild_config)")
+                }
+                if "ban_duration_seconds" not in columns:
+                    connection.execute(
+                        "ALTER TABLE guild_config "
+                        "ADD COLUMN ban_duration_seconds INTEGER NOT NULL DEFAULT 0"
+                    )
 
         await self._run(_create)
 
@@ -151,6 +178,7 @@ class Storage:
                 cross_channel_only=bool(row["cross_channel_only"]),
                 phash_distance=int(row["phash_distance"]),
                 multi_user=bool(row["multi_user"]),
+                ban_duration_seconds=int(row["ban_duration_seconds"]),
             )
 
         return await self._run(_query)
@@ -163,8 +191,9 @@ class Storage:
                     INSERT INTO guild_config (
                         guild_id, report_channel_id, notify_channel_id, action,
                         threshold_count, window_seconds, cross_channel_only,
-                        phash_distance, multi_user, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        phash_distance, multi_user, ban_duration_seconds,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(guild_id) DO UPDATE SET
                         report_channel_id = excluded.report_channel_id,
                         notify_channel_id = excluded.notify_channel_id,
@@ -174,6 +203,7 @@ class Storage:
                         cross_channel_only = excluded.cross_channel_only,
                         phash_distance = excluded.phash_distance,
                         multi_user = excluded.multi_user,
+                        ban_duration_seconds = excluded.ban_duration_seconds,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -186,6 +216,7 @@ class Storage:
                         int(config.cross_channel_only),
                         config.phash_distance,
                         int(config.multi_user),
+                        config.ban_duration_seconds,
                         int(time.time()),
                     ),
                 )
@@ -403,6 +434,7 @@ class Storage:
             STATUS_DELETED,
             STATUS_ACTIONED,
             STATUS_FAILED,
+            STATUS_CANCELLED,
         )
 
         def _delete() -> int:
@@ -410,10 +442,23 @@ class Storage:
                 cursor = connection.execute(
                     """
                     DELETE FROM incidents
-                    WHERE status IN (?, ?, ?, ?)
+                    WHERE status IN (?, ?, ?, ?, ?)
                       AND COALESCE(resolved_at, created_at) < ?
                     """,
                     (*terminal, cutoff),
+                )
+                return cursor.rowcount
+
+        return await self._run(_delete)
+
+    async def purge_bans_before(self, cutoff: int) -> int:
+        """Удаляет старые записи уже снятых временных банов."""
+
+        def _delete() -> int:
+            with closing(self._connect()) as connection, connection:
+                cursor = connection.execute(
+                    "DELETE FROM bans WHERE active = 0 AND unban_at < ?",
+                    (cutoff,),
                 )
                 return cursor.rowcount
 
@@ -631,6 +676,31 @@ class Storage:
 
         return await self._run(_update)
 
+    async def cancel_delete(
+        self, incident_id: int, *, result: str, resolved_at: int
+    ) -> bool:
+        """Останавливает мониторинг удаления, только если он ещё активен."""
+
+        def _update() -> bool:
+            with closing(self._connect()) as connection, connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE incidents SET
+                        status = ?, result = ?, resolved_at = ?, window_closed = 1
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        STATUS_CANCELLED,
+                        result,
+                        resolved_at,
+                        incident_id,
+                        STATUS_WATCHING,
+                    ),
+                )
+                return cursor.rowcount == 1
+
+        return await self._run(_update)
+
     async def reset_actioning(self) -> int:
         """Возвращает в open инциденты, зависшие в обработке после перезапуска."""
 
@@ -657,6 +727,114 @@ class Storage:
             return [self._row_to_incident(row) for row in rows]
 
         return await self._run(_query)
+
+    # --- временные баны -------------------------------------------------
+    @staticmethod
+    def _row_to_ban(row: sqlite3.Row) -> BanRecord:
+        return BanRecord(
+            guild_id=int(row["guild_id"]),
+            user_id=int(row["user_id"]),
+            unban_at=int(row["unban_at"]),
+            banned_at=int(row["banned_at"]),
+            incident_id=row["incident_id"],
+            active=bool(row["active"]),
+            last_attempt_at=int(row["last_attempt_at"]),
+        )
+
+    async def upsert_ban(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        incident_id: Optional[int],
+        banned_at: int,
+        unban_at: int,
+    ) -> None:
+        def _upsert() -> None:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    """
+                    INSERT INTO bans (
+                        guild_id, user_id, incident_id, banned_at, unban_at,
+                        active, last_attempt_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, 0)
+                    ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                        incident_id = excluded.incident_id,
+                        banned_at = excluded.banned_at,
+                        unban_at = excluded.unban_at,
+                        active = 1,
+                        last_attempt_at = 0
+                    """,
+                    (guild_id, user_id, incident_id, banned_at, unban_at),
+                )
+
+        await self._run(_upsert)
+
+    async def clear_ban(self, guild_id: int, user_id: int) -> None:
+        def _delete() -> None:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "DELETE FROM bans WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+
+        await self._run(_delete)
+
+    async def get_active_bans(self, guild_id: int) -> list[BanRecord]:
+        def _query() -> list[BanRecord]:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    "SELECT * FROM bans "
+                    "WHERE guild_id = ? AND active = 1 "
+                    "ORDER BY unban_at ASC",
+                    (guild_id,),
+                ).fetchall()
+            return [self._row_to_ban(row) for row in rows]
+
+        return await self._run(_query)
+
+    async def due_bans(self, now: int) -> list[BanRecord]:
+        """Баны, срок которых истёк; неудачные попытки повторяются раз в час."""
+
+        retry_before = now - 3600
+
+        def _query() -> list[BanRecord]:
+            with closing(self._connect()) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM bans
+                    WHERE active = 1 AND unban_at <= ?
+                      AND (last_attempt_at = 0 OR last_attempt_at <= ?)
+                    ORDER BY unban_at ASC
+                    """,
+                    (now, retry_before),
+                ).fetchall()
+            return [self._row_to_ban(row) for row in rows]
+
+        return await self._run(_query)
+
+    async def mark_unbanned(self, guild_id: int, user_id: int) -> None:
+        def _update() -> None:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "UPDATE bans SET active = 0 WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+
+        await self._run(_update)
+
+    async def mark_ban_attempt(
+        self, guild_id: int, user_id: int, timestamp: int
+    ) -> None:
+        def _update() -> None:
+            with closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "UPDATE bans SET last_attempt_at = ? "
+                    "WHERE guild_id = ? AND user_id = ?",
+                    (timestamp, guild_id, user_id),
+                )
+
+        await self._run(_update)
 
     async def stats(self, guild_id: int) -> dict[str, int]:
         def _query() -> dict[str, int]:

@@ -36,6 +36,7 @@ STATUS_BANNED = "banned"
 STATUS_DELETED = "deleted"
 STATUS_ACTIONED = "actioned"
 STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
 
 
 @dataclass(slots=True)
@@ -49,6 +50,18 @@ class GuildConfig:
     cross_channel_only: bool = False
     phash_distance: int = DEFAULT_PHASH_DISTANCE
     multi_user: bool = False
+    ban_duration_seconds: int = 0
+
+
+@dataclass(slots=True)
+class BanRecord:
+    guild_id: int
+    user_id: int
+    unban_at: int
+    banned_at: int
+    incident_id: Optional[int] = None
+    active: bool = True
+    last_attempt_at: int = 0
 
 
 @dataclass(slots=True)
@@ -103,6 +116,9 @@ _DURATION_UNITS = {
     "d": 86400,
     "д": 86400,
 }
+_PERMANENT_BAN_VALUES = frozenset(
+    {"0", "off", "never", "permanent", "навсегда", "постоянно"}
+)
 
 
 def parse_duration(value: str) -> int:
@@ -122,6 +138,14 @@ def parse_duration(value: str) -> int:
     if seconds > MAX_WINDOW_SECONDS:
         raise ValueError("Максимальное окно — 30 дней.")
     return seconds
+
+
+def parse_ban_duration(value: str) -> int:
+    """Длительность бана: ``7d``, ``12h`` или ``0``/``навсегда``."""
+    text = (value or "").strip().lower()
+    if text in _PERMANENT_BAN_VALUES:
+        return 0
+    return parse_duration(text)
 
 
 def format_duration(seconds: int) -> str:
