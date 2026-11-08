@@ -1,0 +1,17 @@
+.env
+.venv/
+.deps/
+wheels/
+.tmp/
+.pip-cache/
+data/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.pytest_cache/
+tests/_tmp/
+.coverage
+htmlcov/
+*.log
