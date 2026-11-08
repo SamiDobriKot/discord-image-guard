@@ -89,7 +89,7 @@ Discord-бот для защиты сервера от повторяющихс�
 | --- | --- |
 | `/channels report:#канал [notify:#канал]` | Канал отчётов и, необязательно, отдельный канал уведомлений. Если `notify` не указан, уведомления идут в канал отчётов. |
 | `/behavior action:<Бан\|Удаление сообщений\|Уведомление> [duration]` | Что делать при срабатывании порога. `duration` работает только с баном: `7d`, `12h`, `0`/`навсегда`. |
-| `/detection count:<2–100> window:<время> cross_channel:<True/False> [phash_distance:<0–64>] [multi_user:<True/False>]` | Порог, окно, режим разных каналов, допуск pHash и режим нескольких пользователей. |
+| `/detection [count] [window] [cross_channel] [phash_distance] [multi_user]` | Меняет только указанные параметры; нужен хотя бы один. |
 | `/bans` | Показать активные временные баны и время до разбана. |
 | `/roles add role:@роль` | Добавить роль с доступом (только администратор). |
 | `/roles remove role:@роль` | Убрать роль (только администратор). |
@@ -196,6 +196,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 /channels report:#модерация notify:#оповещения
 /behavior action:Уведомление
 /detection count:3 window:1h cross_channel:False phash_distance:8 multi_user:False
+# или только один параметр:
+/detection count:4
 /roles add role:@модераторы
 /roles exclude role:@доверенные
 # временный бан на 7 дней вместо уведомления:

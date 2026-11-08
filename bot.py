@@ -1263,9 +1263,9 @@ class DuplicateGuardBot(discord.Client):
     async def cmd_detection(
         self,
         interaction: discord.Interaction,
-        count: int,
-        window: str,
-        cross_channel: bool,
+        count: Optional[int],
+        window: Optional[str],
+        cross_channel: Optional[bool],
         phash_distance: Optional[int],
         multi_user: Optional[bool],
     ) -> None:
@@ -1273,38 +1273,60 @@ class DuplicateGuardBot(discord.Client):
         if config is None:
             return
 
-        if not MIN_THRESHOLD <= count <= MAX_THRESHOLD:
+        if all(
+            value is None
+            for value in (count, window, cross_channel, phash_distance, multi_user)
+        ):
+            await interaction.response.send_message(
+                "Укажите хотя бы один параметр: count, window, cross_channel, "
+                "phash_distance или multi_user.",
+                ephemeral=True,
+            )
+            return
+
+        if count is not None and not MIN_THRESHOLD <= count <= MAX_THRESHOLD:
             await interaction.response.send_message(
                 f"Порог должен быть от {MIN_THRESHOLD} до {MAX_THRESHOLD}.",
                 ephemeral=True,
             )
             return
-        try:
-            window_seconds = parse_duration(window)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
+
+        if window is not None:
+            try:
+                window_seconds = parse_duration(window)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            if (
+                self.hash_retention_seconds > 0
+                and window_seconds > self.hash_retention_seconds
+            ):
+                await interaction.response.send_message(
+                    "Окно не может быть больше срока хранения хешей "
+                    f"({format_duration(self.hash_retention_seconds)}). "
+                    "Увеличьте `HASH_RETENTION_HOURS` в `.env`.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            window_seconds = None
+
         if (
-            self.hash_retention_seconds > 0
-            and window_seconds > self.hash_retention_seconds
+            phash_distance is not None
+            and not 0 <= phash_distance <= MAX_PHASH_DISTANCE
         ):
-            await interaction.response.send_message(
-                "Окно не может быть больше срока хранения хешей "
-                f"({format_duration(self.hash_retention_seconds)}). "
-                "Увеличьте `HASH_RETENTION_HOURS` в `.env`.",
-                ephemeral=True,
-            )
-            return
-        if phash_distance is not None and not 0 <= phash_distance <= MAX_PHASH_DISTANCE:
             await interaction.response.send_message(
                 f"Допуск pHash должен быть от 0 до {MAX_PHASH_DISTANCE}.",
                 ephemeral=True,
             )
             return
 
-        config.threshold_count = count
-        config.window_seconds = window_seconds
-        config.cross_channel_only = cross_channel
+        if count is not None:
+            config.threshold_count = count
+        if window_seconds is not None:
+            config.window_seconds = window_seconds
+        if cross_channel is not None:
+            config.cross_channel_only = cross_channel
         if phash_distance is not None:
             config.phash_distance = phash_distance
         if multi_user is not None:
@@ -1514,21 +1536,21 @@ def register_commands(bot: DuplicateGuardBot) -> None:
 
     @tree.command(
         name="detection",
-        description="Настроить порог, окно и поиск совпадений",
+        description="Изменить один или несколько параметров обнаружения",
     )
     @app_commands.describe(
-        count="Сколько сообщений с одинаковым изображением нужно для срабатывания",
-        window="Окно времени: 45s, 30m, 2h, 1d (без единицы — минуты)",
-        cross_channel="Считать только совпадения в разных каналах",
-        phash_distance="Допуск pHash 0–64 (0 — только точный pHash)",
-        multi_user="Считать сообщения нескольких пользователей",
+        count="Необязательно: порог сообщений 2–100",
+        window="Необязательно: окно 45s, 30m, 2h, 1d (без единицы — минуты)",
+        cross_channel="Необязательно: считать только совпадения в разных каналах",
+        phash_distance="Необязательно: допуск pHash 0–64",
+        multi_user="Необязательно: считать сообщения нескольких пользователей",
     )
     @app_commands.guild_only()
     async def detection(
         interaction: discord.Interaction,
-        count: app_commands.Range[int, 2, 100],
-        window: str,
-        cross_channel: bool,
+        count: Optional[int] = None,
+        window: Optional[str] = None,
+        cross_channel: Optional[bool] = None,
         phash_distance: Optional[int] = None,
         multi_user: Optional[bool] = None,
     ) -> None:

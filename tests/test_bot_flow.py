@@ -50,6 +50,21 @@ def make_message(
     )
 
 
+class FakeResponse:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send_message(self, content: str, **kwargs) -> None:
+        self.messages.append(content)
+
+
+class FakeInteraction:
+    def __init__(self) -> None:
+        self.guild = SimpleNamespace(id=100)
+        self.user = SimpleNamespace(id=1)
+        self.response = FakeResponse()
+
+
 class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -112,6 +127,40 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
                 "excluded",
             },
         )
+
+    async def test_detection_updates_only_given_parameter(self) -> None:
+        await self.storage.save_config(
+            GuildConfig(
+                guild_id=100,
+                report_channel_id=999,
+                threshold_count=3,
+                window_seconds=3600,
+                cross_channel_only=False,
+                phash_distance=8,
+                multi_user=False,
+            )
+        )
+
+        async def require_allowed(interaction):  # noqa: ANN001
+            return await self.storage.get_config(100)
+
+        self.bot._require_allowed = require_allowed  # type: ignore[method-assign]
+        interaction = FakeInteraction()
+
+        await self.bot.cmd_detection(interaction, 5, None, None, None, None)
+
+        updated = await self.storage.get_config(100)
+        self.assertEqual(updated.threshold_count, 5)
+        self.assertEqual(updated.window_seconds, 3600)
+        self.assertFalse(updated.cross_channel_only)
+        self.assertEqual(updated.phash_distance, 8)
+        self.assertFalse(updated.multi_user)
+        self.assertIn("порог: 5", interaction.response.messages[-1])
+
+        empty = FakeInteraction()
+        await self.bot.cmd_detection(empty, None, None, None, None, None)
+        self.assertIn("хотя бы один", empty.response.messages[-1])
+        self.assertEqual((await self.storage.get_config(100)).threshold_count, 5)
 
     async def test_excluded_author_is_not_indexed(self) -> None:
         await self.storage.add_excluded_role(100, 60)
