@@ -168,7 +168,7 @@ class DuplicateGuardBot(discord.Client):
         ignore_bots: bool = True,
         max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_MB * 1024 * 1024,
         concurrency: int = DEFAULT_CONCURRENCY,
-        hash_retention_seconds: int = 24 * 3600,
+        hash_retention_seconds: int = 3600,
     ) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
@@ -1866,7 +1866,7 @@ def main() -> None:
     if max_download_mb <= 0:
         raise SystemExit("MAX_DOWNLOAD_MB должен быть больше нуля")
 
-    retention_hours = _env_int("HASH_RETENTION_HOURS", 24)
+    retention_hours = _env_int("HASH_RETENTION_HOURS", 1)
     if retention_hours is None:
         retention_hours = 24
     if retention_hours < 0:

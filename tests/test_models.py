@@ -54,7 +54,7 @@ class ConfigTests(unittest.TestCase):
         config = GuildConfig(guild_id=1)
         self.assertEqual(config.action, "notify")
         self.assertEqual(config.threshold_count, 3)
-        self.assertEqual(config.window_seconds, 3600)
+        self.assertEqual(config.window_seconds, 60)
         self.assertEqual(config.phash_distance, 8)
         self.assertFalse(config.cross_channel_only)
         self.assertFalse(config.multi_user)

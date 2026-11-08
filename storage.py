@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS guild_config (
     notify_channel_id   INTEGER,
     action              TEXT NOT NULL DEFAULT 'notify',
     threshold_count     INTEGER NOT NULL DEFAULT 3,
-    window_seconds      INTEGER NOT NULL DEFAULT 3600,
+    window_seconds      INTEGER NOT NULL DEFAULT 60,
     cross_channel_only  INTEGER NOT NULL DEFAULT 0,
     phash_distance      INTEGER NOT NULL DEFAULT 8,
     multi_user          INTEGER NOT NULL DEFAULT 0,
