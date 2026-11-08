@@ -10,8 +10,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from bot import DuplicateGuardBot
+from detection import MessageGroup
 from hashing import ImageHashes
-from models import STATUS_OPEN, STATUS_WATCHING, GuildConfig, Incident
+from models import (
+    STATUS_MERGED,
+    STATUS_OPEN,
+    STATUS_WATCHING,
+    GuildConfig,
+    Incident,
+    IncidentImage,
+)
 from storage import Storage
 
 TEST_TMP_ROOT = Path(__file__).resolve().parent / "_tmp"
@@ -20,6 +28,20 @@ HASHES = ImageHashes(
     phash="0123456789abcdef",
     width=100,
     height=50,
+    image_format="PNG",
+)
+HASHES_B = ImageHashes(
+    sha256="b" * 64,
+    phash="fedcba9876543210",
+    width=120,
+    height=60,
+    image_format="PNG",
+)
+HASHES_C = ImageHashes(
+    sha256="c" * 64,
+    phash="0011223344556677",
+    width=140,
+    height=70,
     image_format="PNG",
 )
 
@@ -78,11 +100,11 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         async def hash_attachment(attachment, guild_id):  # noqa: ANN001
             return HASHES
 
-        async def detect(guild, config, image):  # noqa: ANN001
-            self.detected.append(image)
+        async def detect_message(guild, config, message, images):  # noqa: ANN001
+            self.detected.extend(images)
 
         self.bot._hash_attachment = hash_attachment  # type: ignore[method-assign]
-        self.bot._detect = detect  # type: ignore[method-assign]
+        self.bot._detect_message = detect_message  # type: ignore[method-assign]
 
     async def asyncTearDown(self) -> None:
         shutil.rmtree(self._case_dir, ignore_errors=True)
@@ -185,8 +207,10 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
             opened.append(incident)
 
         self.bot._apply_action = apply_action  # type: ignore[method-assign]
-        self.bot._detect = DuplicateGuardBot._detect.__get__(  # type: ignore[method-assign]
-            self.bot, DuplicateGuardBot
+        self.bot._detect_message = (  # type: ignore[method-assign]
+            DuplicateGuardBot._detect_message.__get__(
+                self.bot, DuplicateGuardBot
+            )
         )
 
         first = make_message(make_attachment(1), message_id=10)
@@ -199,6 +223,117 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(opened), 1)
         self.assertEqual(opened[0].count, 2)
         self.assertEqual(opened[0].user_ids, [200])
+
+    async def test_multi_image_message_is_one_detection(self) -> None:
+        config = GuildConfig(
+            guild_id=100,
+            report_channel_id=999,
+            threshold_count=2,
+            action="notify",
+        )
+        await self.storage.save_config(config)
+        opened: list = []
+
+        async def apply_action(guild, cfg, incident):  # noqa: ANN001
+            opened.append(incident)
+
+        async def mixed_hash(attachment, guild_id):  # noqa: ANN001
+            return HASHES if attachment.id in (1, 3) else HASHES_B
+
+        self.bot._apply_action = apply_action  # type: ignore[method-assign]
+        self.bot._hash_attachment = mixed_hash  # type: ignore[method-assign]
+        self.bot._detect_message = (  # type: ignore[method-assign]
+            DuplicateGuardBot._detect_message.__get__(
+                self.bot, DuplicateGuardBot
+            )
+        )
+
+        first = make_message(make_attachment(1), message_id=10, channel_id=300)
+        first.attachments.append(make_attachment(2))
+        second = make_message(make_attachment(3), message_id=11, channel_id=301)
+        second.attachments.append(make_attachment(4))
+
+        await self.bot.process_message(first)
+        self.assertEqual(opened, [])
+
+        await self.bot.process_message(second)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].count, 2)
+        self.assertEqual(len(opened[0].images), 2)
+        self.assertEqual(len(opened[0].message_ids), 2)
+
+    async def test_subset_message_joins_existing_case(self) -> None:
+        config = GuildConfig(
+            guild_id=100,
+            report_channel_id=999,
+            threshold_count=2,
+            action="notify",
+        )
+        await self.storage.save_config(config)
+        opened: list = []
+
+        async def apply_action(guild, cfg, incident):  # noqa: ANN001
+            opened.append(incident)
+            incident.status = STATUS_OPEN
+            await self.storage.set_status(incident.id, STATUS_OPEN)
+
+        async def mixed_hash(attachment, guild_id):  # noqa: ANN001
+            return {
+                1: HASHES,
+                2: HASHES_B,
+                3: HASHES_C,
+                4: HASHES,
+                5: HASHES_B,
+                6: HASHES_C,
+                7: HASHES,
+                8: HASHES_B,
+                9: HASHES_C,
+            }[attachment.id]
+
+        async def publish_alert(guild, cfg, incident):  # noqa: ANN001
+            return True
+
+        self.bot._apply_action = apply_action  # type: ignore[method-assign]
+        self.bot._publish_alert = publish_alert  # type: ignore[method-assign]
+        self.bot._hash_attachment = mixed_hash  # type: ignore[method-assign]
+        self.bot._detect_message = (  # type: ignore[method-assign]
+            DuplicateGuardBot._detect_message.__get__(
+                self.bot, DuplicateGuardBot
+            )
+        )
+
+        def message_with(ids: list[int], message_id: int, channel_id: int):
+            message = make_message(
+                make_attachment(ids[0]),
+                message_id=message_id,
+                channel_id=channel_id,
+            )
+            message.attachments.extend(
+                make_attachment(attachment_id) for attachment_id in ids[1:]
+            )
+            return message
+
+        first = message_with([1, 2, 3], 10, 300)
+        second = message_with([4, 5, 6], 11, 301)
+        subset = message_with([7, 8], 12, 302)
+        third_image = message_with([9], 13, 303)
+
+        await self.bot.process_message(first)
+        self.assertEqual(opened, [])
+        await self.bot.process_message(second)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].count, 2)
+        self.assertEqual(len(opened[0].images), 3)
+
+        await self.bot.process_message(subset)
+        stored = await self.storage.get_incident(opened[0].id)
+        assert stored is not None
+        self.assertEqual(stored.count, 3)
+
+        await self.bot.process_message(third_image)
+        stored = await self.storage.get_incident(opened[0].id)
+        assert stored is not None
+        self.assertEqual(stored.count, 4)
 
     async def test_extend_notification_updates_count_and_window(self) -> None:
         now = int(datetime.now(timezone.utc).timestamp())
@@ -237,9 +372,16 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
 
         self.bot._publish_alert = publish_alert  # type: ignore[method-assign]
         config = GuildConfig(guild_id=100, report_channel_id=999)
+        group = MessageGroup(
+            message_id=11,
+            channel_id=300,
+            user_id=200,
+            created_at=now,
+            images=[image],
+        )
 
         await self.bot._extend_incident(
-            SimpleNamespace(id=100), config, incident, image
+            SimpleNamespace(id=100), config, incident, [group]
         )
 
         self.assertEqual(incident.count, 2)
@@ -291,15 +433,81 @@ class ProcessMessageTests(unittest.IsolatedAsyncioTestCase):
         self.bot._delete_refs = delete_refs  # type: ignore[method-assign]
         self.bot._publish_report = publish_report  # type: ignore[method-assign]
         config = GuildConfig(guild_id=100, report_channel_id=999)
+        group = MessageGroup(
+            message_id=12,
+            channel_id=300,
+            user_id=200,
+            created_at=now,
+            images=[image],
+        )
 
         await self.bot._extend_incident(
-            SimpleNamespace(id=100), config, incident, image
+            SimpleNamespace(id=100), config, incident, [group]
         )
 
         self.assertEqual(incident.count, 2)
         self.assertEqual(incident.status, STATUS_WATCHING)
         self.assertEqual(len(reports), 1)
         self.assertIn("Удалено: 1", reports[0][2])
+
+    async def test_merge_incidents_keeps_oldest(self) -> None:
+        now = int(datetime.now(timezone.utc).timestamp())
+        common = dict(
+            guild_id=100,
+            action="notify",
+            status=STATUS_OPEN,
+            filename="pic.png",
+            image_url=None,
+            count=1,
+            created_at=now,
+            last_activity_at=now,
+            expires_at=now + 3600,
+        )
+        first = await self.storage.create_incident(
+            **common,
+            sha256=HASHES.sha256,
+            phash=HASHES.phash,
+            user_ids=[200],
+            message_ids=[(300, 10)],
+            images=[
+                IncidentImage(
+                    sha256=HASHES.sha256, phash=HASHES.phash, filename="a.png"
+                )
+            ],
+        )
+        second = await self.storage.create_incident(
+            **common,
+            sha256=HASHES_B.sha256,
+            phash=HASHES_B.phash,
+            user_ids=[201],
+            message_ids=[(301, 11)],
+            images=[
+                IncidentImage(
+                    sha256=HASHES_B.sha256,
+                    phash=HASHES_B.phash,
+                    filename="b.png",
+                )
+            ],
+        )
+
+        async def publish_report(
+            guild, config, incident, **kwargs
+        ):  # noqa: ANN001
+            return None
+
+        self.bot._publish_report = publish_report  # type: ignore[method-assign]
+        config = GuildConfig(guild_id=100, report_channel_id=999)
+
+        await self.bot._merge_incidents(
+            SimpleNamespace(id=100), config, first, second
+        )
+
+        stored_first = await self.storage.get_incident(first.id)
+        stored_second = await self.storage.get_incident(second.id)
+        assert stored_first is not None and stored_second is not None
+        self.assertEqual(stored_first.count, 2)
+        self.assertEqual(len(stored_first.images), 2)
+        self.assertEqual(stored_second.status, STATUS_MERGED)
 
     async def test_ban_action_bans_all_users(self) -> None:
         incident = Incident(

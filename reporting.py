@@ -12,6 +12,7 @@ from models import (
     BanRecord,
     GuildConfig,
     Incident,
+    IncidentImage,
     format_duration,
     plural,
 )
@@ -55,6 +56,31 @@ def _message_count_text(count: int) -> str:
     return f"{count} {plural(count, 'сообщение', 'сообщения', 'сообщений')}"
 
 
+def incident_images(incident: Incident) -> list[IncidentImage]:
+    if incident.images:
+        return list(incident.images)
+    return [
+        IncidentImage(
+            sha256=incident.sha256,
+            phash=incident.phash,
+            filename=incident.filename,
+            image_url=incident.image_url,
+        )
+    ]
+
+
+def format_incident_images(images: Iterable[IncidentImage], limit: int = 6) -> str:
+    items = list(images)
+    lines: list[str] = []
+    for index, image in enumerate(items[:limit], start=1):
+        name = sanitize_text(image.filename or f"картинка {index}", 80)
+        url = safe_image_url(image.image_url)
+        lines.append(f"{index}. [{name}]({url})" if url else f"{index}. {name}")
+    if len(items) > limit:
+        lines.append(f"и ещё {len(items) - limit}")
+    return "\n".join(lines) or "—"
+
+
 def build_alert_embed(
     incident: Incident,
     window_seconds: int,
@@ -71,6 +97,11 @@ def build_alert_embed(
         f"Обнаружено **{_message_count_text(incident.count)}** "
         "с одинаковым или похожим изображением."
     )
+    images = incident_images(incident)
+    if len(images) > 1:
+        description += (
+            f"\nВ этих сообщениях несколько изображений: {len(images)}."
+        )
     if closed:
         description += "\nПриём новых сообщений по этому инциденту завершён."
     embed.description = description
@@ -81,9 +112,17 @@ def build_alert_embed(
         inline=False,
     )
     embed.add_field(name="Сообщений", value=str(incident.count), inline=True)
-    filename = sanitize_text(incident.filename, 200)
-    if filename:
-        embed.add_field(name="Файл", value=filename, inline=True)
+    if len(images) > 1:
+        embed.add_field(name="Изображений", value=str(len(images)), inline=True)
+        embed.add_field(
+            name="Картинки",
+            value=format_incident_images(images),
+            inline=False,
+        )
+    else:
+        filename = sanitize_text(images[0].filename, 200)
+        if filename:
+            embed.add_field(name="Файл", value=filename, inline=True)
     window_text = (
         "приём завершён"
         if closed
@@ -96,7 +135,7 @@ def build_alert_embed(
         inline=False,
     )
 
-    thumbnail = safe_image_url(incident.image_url)
+    thumbnail = safe_image_url(images[0].image_url)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     embed.set_footer(
@@ -124,9 +163,18 @@ def build_report_embed(
         inline=False,
     )
     embed.add_field(name="Сообщений", value=str(incident.count), inline=True)
-    filename = sanitize_text(incident.filename, 200)
-    if filename:
-        embed.add_field(name="Файл", value=filename, inline=True)
+    images = incident_images(incident)
+    if len(images) > 1:
+        embed.add_field(name="Изображений", value=str(len(images)), inline=True)
+        embed.add_field(
+            name="Картинки",
+            value=format_incident_images(images),
+            inline=False,
+        )
+    else:
+        filename = sanitize_text(images[0].filename, 200)
+        if filename:
+            embed.add_field(name="Файл", value=filename, inline=True)
     embed.add_field(
         name="Окно",
         value=format_duration(max(0, incident.expires_at - incident.created_at)),
@@ -139,7 +187,7 @@ def build_report_embed(
         inline=False,
     )
 
-    thumbnail = safe_image_url(incident.image_url)
+    thumbnail = safe_image_url(images[0].image_url)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     embed.set_footer(

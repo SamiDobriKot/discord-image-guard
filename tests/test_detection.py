@@ -6,13 +6,15 @@ import unittest
 
 from detection import (
     cluster_qualifies,
+    image_sets_match,
     incident_matches,
+    incident_matches_set,
     phash_distance,
     select_cluster,
     unique_messages,
     unique_users,
 )
-from models import ImageRecord, Incident
+from models import ImageRecord, Incident, IncidentImage
 
 
 def make_image(
@@ -131,6 +133,48 @@ class ClusterTests(unittest.TestCase):
         )
         self.assertFalse(incident_matches(incident, other_user, 0, False))
         self.assertTrue(incident_matches(incident, other_user, 0, True))
+
+    def test_image_sets_match_order_independently(self) -> None:
+        first = [
+            make_image(1, sha256="a" * 64, phash="0" * 16, message_id=10),
+            make_image(2, sha256="b" * 64, phash="f" * 16, message_id=10),
+        ]
+        second = [
+            make_image(3, sha256="b" * 64, phash="f" * 16, message_id=11),
+            make_image(4, sha256="a" * 64, phash="0" * 16, message_id=11),
+        ]
+
+        self.assertTrue(image_sets_match(first, second, 0))
+        self.assertFalse(image_sets_match(first, second[:1], 0))
+
+    def test_image_set_matching_with_phash_tolerance(self) -> None:
+        current = [make_image(1, sha256="c" * 64, phash="0000000000000001")]
+        stored = [make_image(2, sha256="d" * 64, phash="0" * 16)]
+
+        self.assertTrue(image_sets_match(current, stored, 1))
+        self.assertFalse(image_sets_match(current, stored, 0))
+
+    def test_incident_matches_message_set(self) -> None:
+        incident = make_incident(user_ids=[1])
+        incident.images = [
+            IncidentImage(
+                sha256="a" * 64,
+                phash="0" * 16,
+                filename="a.png",
+            ),
+            IncidentImage(
+                sha256="b" * 64,
+                phash="f" * 16,
+                filename="b.png",
+            ),
+        ]
+        current = [
+            make_image(1, sha256="b" * 64, phash="f" * 16),
+            make_image(2, sha256="a" * 64, phash="0" * 16),
+        ]
+
+        self.assertTrue(incident_matches_set(incident, current, 0, False, 1))
+        self.assertFalse(incident_matches_set(incident, current, 0, False, 2))
 
 
 if __name__ == "__main__":

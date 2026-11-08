@@ -8,7 +8,13 @@ import unittest
 import uuid
 from pathlib import Path
 
-from models import STATUS_BANNED, STATUS_OPEN, STATUS_WATCHING, GuildConfig
+from models import (
+    STATUS_BANNED,
+    STATUS_OPEN,
+    STATUS_WATCHING,
+    GuildConfig,
+    IncidentImage,
+)
 from storage import Storage
 
 TEST_TMP_ROOT = Path(__file__).resolve().parent / "_tmp"
@@ -198,6 +204,29 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await self.storage.claim_for_action(incident.id))
         self.assertFalse(await self.storage.claim_for_action(incident.id))
+
+    async def test_incident_images_roundtrip(self) -> None:
+        incident = await self._create_incident(
+            images=[
+                IncidentImage(
+                    sha256="a" * 64,
+                    phash="0" * 16,
+                    filename="a.png",
+                    image_url="https://cdn.discordapp.com/attachments/1/2/a.png",
+                ),
+                IncidentImage(
+                    sha256="b" * 64,
+                    phash="f" * 16,
+                    filename="b.png",
+                ),
+            ]
+        )
+
+        stored = await self.storage.get_incident(incident.id)
+        assert stored is not None
+        self.assertEqual(len(stored.images), 2)
+        self.assertEqual(stored.images[0].filename, "a.png")
+        self.assertEqual(stored.images[1].sha256, "b" * 64)
 
     async def test_expired_incidents(self) -> None:
         incident = await self._create_incident(expires_at=1000)

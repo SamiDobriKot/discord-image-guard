@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from models import BanRecord, GuildConfig, Incident
+from models import BanRecord, GuildConfig, Incident, IncidentImage
 from reporting import (
     build_alert_embed,
     build_bans_embed,
@@ -54,6 +54,30 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("Сообщений", names)
         self.assertIn("Файл", names)
         self.assertIsNotNone(embed.thumbnail.url)
+
+    def test_alert_lists_multiple_images(self) -> None:
+        incident = make_incident()
+        incident.images = [
+            IncidentImage(
+                sha256="a" * 64,
+                phash="0" * 16,
+                filename="one.png",
+                image_url="https://cdn.discordapp.com/attachments/1/2/one.png",
+            ),
+            IncidentImage(
+                sha256="b" * 64,
+                phash="f" * 16,
+                filename="two.png",
+                image_url="https://cdn.discordapp.com/attachments/1/2/two.png",
+            ),
+        ]
+
+        embed = build_alert_embed(incident, 3600)
+        names = {field.name: field.value for field in embed.fields}
+        self.assertEqual(names["Изображений"], "2")
+        self.assertIn("one.png", names["Картинки"])
+        self.assertIn("two.png", names["Картинки"])
+        self.assertIn("несколько изображений", embed.description)
 
     def test_report_contains_result(self) -> None:
         embed = build_report_embed(

@@ -19,11 +19,11 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 from detection import (
-    cluster_qualifies,
-    incident_matches,
-    select_cluster,
-    unique_messages,
-    unique_users,
+    MessageGroup,
+    connected_message_groups,
+    group_messages,
+    incident_matches_message,
+    unique_images_by_sha,
 )
 from hashing import HashingError, ImageHashes, compute_hashes, is_image_attachment
 from models import (
@@ -36,10 +36,13 @@ from models import (
     STATUS_CANCELLED,
     STATUS_DELETED,
     STATUS_FAILED,
+    STATUS_MERGED,
     STATUS_OPEN,
     STATUS_WATCHING,
     GuildConfig,
+    ImageRecord,
     Incident,
+    IncidentImage,
     format_duration,
     parse_ban_duration,
     parse_duration,
@@ -257,7 +260,7 @@ class DuplicateGuardBot(discord.Client):
             return 0
 
         config = await self.storage.get_config(guild.id)
-        indexed = 0
+        images: list[ImageRecord] = []
 
         for attachment in attachments:
             try:
@@ -280,15 +283,8 @@ class DuplicateGuardBot(discord.Client):
                     attachment_url=attachment.url,
                     created_at=int(message.created_at.timestamp()),
                 )
-                if not created:
-                    continue
-
-                indexed += 1
-
-                if config.report_channel_id is None:
-                    continue
-
-                await self._detect(guild, config, image)
+                if created:
+                    images.append(image)
             except HashingError as exc:
                 self._warn(
                     guild.id,
@@ -299,7 +295,11 @@ class DuplicateGuardBot(discord.Client):
                     guild.id,
                     f"Не удалось обработать вложение {attachment.filename!r}: {exc}",
                 )
-        return indexed
+
+        if images and config.report_channel_id is not None:
+            await self._detect_message(guild, config, message, images)
+
+        return len(images)
 
     async def _is_excluded_author(self, message: discord.Message) -> bool:
         roles = getattr(message.author, "roles", None)
@@ -331,39 +331,95 @@ class DuplicateGuardBot(discord.Client):
                 return None
             return await asyncio.to_thread(compute_hashes, data)
 
-    async def _detect(
-        self, guild: discord.Guild, config: GuildConfig, image
+    async def _detect_message(
+        self,
+        guild: discord.Guild,
+        config: GuildConfig,
+        message: discord.Message,
+        images: list[ImageRecord],
     ) -> None:
         now = int(time.time())
-
-        for incident in await self.storage.active_incidents(guild.id, now):
-            if incident_matches(
-                incident, image, config.phash_distance, config.multi_user
-            ):
-                await self._extend_incident(guild, config, incident, image)
-                return
+        current_images = unique_images_by_sha(images)
+        if not current_images:
+            return
 
         since = now - config.window_seconds
         recent = await self.storage.recent_images(
             guild.id,
             since,
-            user_id=None if config.multi_user else image.user_id,
+            user_id=None if config.multi_user else message.author.id,
         )
-        cluster = select_cluster(image, recent, config.phash_distance)
+        groups = group_messages(recent)
+        if not any(group.message_id == message.id for group in groups):
+            groups.append(
+                MessageGroup(
+                    message_id=message.id,
+                    channel_id=message.channel.id,
+                    user_id=message.author.id,
+                    created_at=int(message.created_at.timestamp()),
+                    images=images,
+                )
+            )
 
-        if not cluster_qualifies(
-            cluster, config.threshold_count, config.cross_channel_only
-        ):
+        component = connected_message_groups(
+            groups, message.id, config.phash_distance
+        )
+        component.sort(key=lambda group: group.created_at)
+        component_images = unique_images_by_sha(
+            image for group in component for image in group.images
+        )
+
+        active_matches = [
+            incident
+            for incident in await self.storage.active_incidents(guild.id, now)
+            if incident_matches_message(
+                incident,
+                component_images,
+                config.phash_distance,
+                config.multi_user,
+                message.author.id,
+            )
+        ]
+        if active_matches:
+            survivor = min(
+                active_matches, key=lambda item: (item.created_at, item.id)
+            )
+            for other in active_matches:
+                if other.id != survivor.id:
+                    await self._merge_incidents(
+                        guild, config, survivor, other
+                    )
+            await self._extend_incident(
+                guild, config, survivor, component
+            )
             return
 
-        await self._open_incident(guild, config, cluster)
+        if len(component) < max(2, config.threshold_count):
+            return
+        if config.cross_channel_only and len(
+            {group.channel_id for group in component}
+        ) < 2:
+            return
+
+        await self._open_incident(
+            guild, config, component, component_images
+        )
 
     async def _open_incident(
-        self, guild: discord.Guild, config: GuildConfig, cluster: list
+        self,
+        guild: discord.Guild,
+        config: GuildConfig,
+        groups: list[MessageGroup],
+        component_images: list[ImageRecord],
     ) -> None:
         now = int(time.time())
-        latest = cluster[-1]
-        messages = unique_messages(cluster)
+        latest = component_images[0]
+        messages = list(
+            dict.fromkeys(
+                (group.channel_id, group.message_id) for group in groups
+            )
+        )
+        users = list(dict.fromkeys(group.user_id for group in groups))
 
         incident = await self.storage.create_incident(
             guild_id=guild.id,
@@ -373,19 +429,35 @@ class DuplicateGuardBot(discord.Client):
             phash=latest.phash,
             filename=latest.filename,
             image_url=latest.attachment_url,
-            user_ids=unique_users(cluster),
+            user_ids=users,
             message_ids=messages,
             count=len(messages),
             created_at=now,
             last_activity_at=now,
             expires_at=now + config.window_seconds,
+            images=[
+                IncidentImage(
+                    sha256=image.sha256,
+                    phash=image.phash,
+                    filename=image.filename,
+                    image_url=image.attachment_url,
+                )
+                for image in component_images
+            ],
         )
 
-        await self.storage.mark_actioned([item.id for item in cluster], now)
+        all_image_ids = [
+            image.id for group in groups for image in group.images
+        ]
+        await self.storage.mark_actioned(all_image_ids, now)
         await self._apply_action(guild, config, incident)
 
     async def _extend_incident(
-        self, guild: discord.Guild, config: GuildConfig, incident: Incident, image
+        self,
+        guild: discord.Guild,
+        config: GuildConfig,
+        incident: Incident,
+        groups: list[MessageGroup],
     ) -> None:
         now = int(time.time())
         fresh = await self.storage.get_incident(incident.id)
@@ -396,12 +468,41 @@ class DuplicateGuardBot(discord.Client):
             or fresh.status not in (STATUS_OPEN, STATUS_WATCHING)
         ):
             return
-        users = list(dict.fromkeys([*incident.user_ids, image.user_id]))
-        messages = list(
+
+        users = list(
             dict.fromkeys(
-                [*incident.message_ids, (image.channel_id, image.message_id)]
+                [
+                    *incident.user_ids,
+                    *(group.user_id for group in groups),
+                ]
             )
         )
+        messages = list(
+            dict.fromkeys(
+                [
+                    *incident.message_ids,
+                    *(
+                        (group.channel_id, group.message_id)
+                        for group in groups
+                    ),
+                ]
+            )
+        )
+        incident_images = list(incident.images)
+        known_sha = {image.sha256 for image in incident_images}
+        for group in groups:
+            for image in group.images:
+                if image.sha256 in known_sha:
+                    continue
+                known_sha.add(image.sha256)
+                incident_images.append(
+                    IncidentImage(
+                        sha256=image.sha256,
+                        phash=image.phash,
+                        filename=image.filename,
+                        image_url=image.attachment_url,
+                    )
+                )
         expires_at = now + config.window_seconds
 
         await self.storage.append_incident(
@@ -411,18 +512,23 @@ class DuplicateGuardBot(discord.Client):
             count=len(messages),
             last_activity_at=now,
             expires_at=expires_at,
+            images=incident_images,
         )
-        await self.storage.mark_actioned([image.id], now)
+        await self.storage.mark_actioned(
+            [image.id for group in groups for image in group.images], now
+        )
 
         incident.user_ids = users
         incident.message_ids = messages
+        incident.images = incident_images
         incident.count = len(messages)
         incident.last_activity_at = now
         incident.expires_at = expires_at
 
         if incident.action == "delete" or incident.status == STATUS_WATCHING:
             deleted, gone, failed = await self._delete_refs(
-                guild, [(image.channel_id, image.message_id)]
+                guild,
+                [(group.channel_id, group.message_id) for group in groups],
             )
             result = self._delete_summary(
                 deleted, gone, failed, monitoring=True, window=config.window_seconds
@@ -443,6 +549,88 @@ class DuplicateGuardBot(discord.Client):
             await self._publish_alert(guild, config, incident)
 
     # --- действия -------------------------------------------------------
+    async def _merge_incidents(
+        self,
+        guild: discord.Guild,
+        config: GuildConfig,
+        survivor: Incident,
+        other: Incident,
+    ) -> None:
+        if survivor.id == other.id:
+            return
+        now = int(time.time())
+        users = list(dict.fromkeys([*survivor.user_ids, *other.user_ids]))
+        messages = list(
+            dict.fromkeys([*survivor.message_ids, *other.message_ids])
+        )
+        images = list(survivor.images)
+        known_sha = {image.sha256 for image in images}
+        for image in other.images:
+            if image.sha256 not in known_sha:
+                known_sha.add(image.sha256)
+                images.append(image)
+
+        await self.storage.append_incident(
+            survivor.id,
+            user_ids=users,
+            message_ids=messages,
+            count=len(messages),
+            last_activity_at=max(
+                survivor.last_activity_at, other.last_activity_at
+            ),
+            expires_at=max(survivor.expires_at, other.expires_at),
+            images=images,
+        )
+
+        survivor.user_ids = users
+        survivor.message_ids = messages
+        survivor.images = images
+        survivor.count = len(messages)
+        survivor.last_activity_at = max(
+            survivor.last_activity_at, other.last_activity_at
+        )
+        survivor.expires_at = max(survivor.expires_at, other.expires_at)
+
+        await self.storage.set_status(
+            other.id,
+            STATUS_MERGED,
+            result=f"Объединено с инцидентом #{survivor.id}.",
+            resolved_at=now,
+            window_closed=True,
+            expected_status=other.status,
+        )
+        other.status = STATUS_MERGED
+        other.result = f"Объединено с инцидентом #{survivor.id}."
+        other.resolved_at = now
+        other.window_closed = True
+
+        if other.alert_channel_id and other.alert_message_id:
+            embed = build_alert_embed(
+                other, config.window_seconds, closed=True
+            )
+            embed.add_field(
+                name="Результат",
+                value=other.result,
+                inline=False,
+            )
+            await self._edit_message(
+                guild,
+                other.alert_channel_id,
+                other.alert_message_id,
+                embed=embed,
+                view=None,
+            )
+
+        await self._publish_report(
+            guild,
+            config,
+            other,
+            title="Инцидент объединён",
+            result_text=other.result,
+            color=COLOR_NOTIFY,
+            remove_view=True,
+        )
+
     async def _apply_action(
         self, guild: discord.Guild, config: GuildConfig, incident: Incident
     ) -> None:

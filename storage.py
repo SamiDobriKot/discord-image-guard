@@ -18,12 +18,14 @@ from models import (
     STATUS_CANCELLED,
     STATUS_DELETED,
     STATUS_FAILED,
+    STATUS_MERGED,
     STATUS_OPEN,
     STATUS_WATCHING,
     BanRecord,
     GuildConfig,
     ImageRecord,
     Incident,
+    IncidentImage,
 )
 
 T = TypeVar("T")
@@ -87,6 +89,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     phash             TEXT NOT NULL,
     filename          TEXT,
     image_url         TEXT,
+    images            TEXT,
     user_ids          TEXT NOT NULL,
     message_ids       TEXT NOT NULL,
     count             INTEGER NOT NULL,
@@ -155,6 +158,15 @@ class Storage:
                     connection.execute(
                         "ALTER TABLE guild_config "
                         "ADD COLUMN ban_duration_seconds INTEGER NOT NULL DEFAULT 0"
+                    )
+
+                incident_columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(incidents)")
+                }
+                if "images" not in incident_columns:
+                    connection.execute(
+                        "ALTER TABLE incidents ADD COLUMN images TEXT"
                     )
 
         await self._run(_create)
@@ -435,6 +447,7 @@ class Storage:
             STATUS_ACTIONED,
             STATUS_FAILED,
             STATUS_CANCELLED,
+            STATUS_MERGED,
         )
 
         def _delete() -> int:
@@ -442,7 +455,7 @@ class Storage:
                 cursor = connection.execute(
                     """
                     DELETE FROM incidents
-                    WHERE status IN (?, ?, ?, ?, ?)
+                    WHERE status IN (?, ?, ?, ?, ?, ?)
                       AND COALESCE(resolved_at, created_at) < ?
                     """,
                     (*terminal, cutoff),
@@ -465,7 +478,40 @@ class Storage:
         return await self._run(_delete)
 
     # --- инциденты ------------------------------------------------------
+    @staticmethod
+    def _serialize_images(images: list[IncidentImage]) -> str:
+        return json.dumps(
+            [
+                {
+                    "sha256": image.sha256,
+                    "phash": image.phash,
+                    "filename": image.filename,
+                    "image_url": image.image_url,
+                }
+                for image in images
+            ]
+        )
+
     def _row_to_incident(self, row: sqlite3.Row) -> Incident:
+        raw_images = json.loads(row["images"]) if row["images"] else []
+        images = [
+            IncidentImage(
+                sha256=item["sha256"],
+                phash=item["phash"],
+                filename=item.get("filename"),
+                image_url=item.get("image_url"),
+            )
+            for item in raw_images
+        ]
+        if not images:
+            images = [
+                IncidentImage(
+                    sha256=row["sha256"],
+                    phash=row["phash"],
+                    filename=row["filename"],
+                    image_url=row["image_url"],
+                )
+            ]
         return Incident(
             id=int(row["id"]),
             guild_id=int(row["guild_id"]),
@@ -491,6 +537,7 @@ class Storage:
             result=row["result"],
             window_closed=bool(row["window_closed"]),
             resolved_at=row["resolved_at"],
+            images=images,
         )
 
     async def create_incident(
@@ -509,16 +556,30 @@ class Storage:
         created_at: int,
         last_activity_at: int,
         expires_at: int,
+        images: Optional[list[IncidentImage]] = None,
     ) -> Incident:
+        image_payload = self._serialize_images(
+            images
+            if images is not None
+            else [
+                IncidentImage(
+                    sha256=sha256,
+                    phash=phash,
+                    filename=filename,
+                    image_url=image_url,
+                )
+            ]
+        )
+
         def _insert() -> Incident:
             with closing(self._connect()) as connection, connection:
                 cursor = connection.execute(
                     """
                     INSERT INTO incidents (
                         guild_id, action, status, sha256, phash, filename, image_url,
-                        user_ids, message_ids, count, created_at, last_activity_at,
-                        expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        images, user_ids, message_ids, count, created_at,
+                        last_activity_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         guild_id,
@@ -528,6 +589,7 @@ class Storage:
                         phash,
                         filename,
                         image_url,
+                        image_payload,
                         json.dumps(user_ids),
                         json.dumps([list(ref) for ref in message_ids]),
                         count,
@@ -579,24 +641,31 @@ class Storage:
         count: int,
         last_activity_at: int,
         expires_at: int,
+        images: Optional[list[IncidentImage]] = None,
     ) -> None:
         def _update() -> None:
+            fields = [
+                "user_ids = ?",
+                "message_ids = ?",
+                "count = ?",
+                "last_activity_at = ?",
+                "expires_at = ?",
+            ]
+            params: list[Any] = [
+                json.dumps(user_ids),
+                json.dumps([list(ref) for ref in message_ids]),
+                count,
+                last_activity_at,
+                expires_at,
+            ]
+            if images is not None:
+                fields.append("images = ?")
+                params.append(self._serialize_images(images))
+            params.append(incident_id)
             with closing(self._connect()) as connection, connection:
                 connection.execute(
-                    """
-                    UPDATE incidents SET
-                        user_ids = ?, message_ids = ?, count = ?,
-                        last_activity_at = ?, expires_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        json.dumps(user_ids),
-                        json.dumps([list(ref) for ref in message_ids]),
-                        count,
-                        last_activity_at,
-                        expires_at,
-                        incident_id,
-                    ),
+                    f"UPDATE incidents SET {', '.join(fields)} WHERE id = ?",
+                    params,
                 )
 
         await self._run(_update)

@@ -37,6 +37,7 @@ STATUS_DELETED = "deleted"
 STATUS_ACTIONED = "actioned"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
+STATUS_MERGED = "merged"
 
 
 @dataclass(slots=True)
@@ -79,6 +80,14 @@ class ImageRecord:
     created_at: int
 
 
+@dataclass(frozen=True, slots=True)
+class IncidentImage:
+    sha256: str
+    phash: str
+    filename: Optional[str] = None
+    image_url: Optional[str] = None
+
+
 @dataclass(slots=True)
 class Incident:
     id: int
@@ -102,6 +111,7 @@ class Incident:
     result: Optional[str] = None
     window_closed: bool = False
     resolved_at: Optional[int] = None
+    images: list[IncidentImage] = field(default_factory=list)
 
 
 _DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhdсчмд]?)\s*$", re.IGNORECASE)
